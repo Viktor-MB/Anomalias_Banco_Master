@@ -9,8 +9,8 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+from catboost import CatBoostClassifier
+from sklearn.preprocessing import RobustScaler
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -369,50 +369,124 @@ def load_data():
     }
     df["grupo_display"] = df["grupo_economico"].map(grupo_map).fillna(df["grupo_economico"])
 
-    # Garantir tipos numéricos nas features
-    feature_cols = [
+    # Garantir tipos numéricos nas features base
+    base_cols = [
         "taxa_inadimplencia", "concentracao_cedente",
         "taxa_aquisicao", "taxa_devolucao_cedente", "ratio_inad_giro",
     ]
-    for c in feature_cols:
+    for c in base_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # PL mínimo de 1 milhão (filtro de qualidade)
-    df = df[df["TAB_IV_A_VL_PL"] >= 1_000_000].copy()
+    # PL mínimo de 1 mil (filtro de qualidade — mesma lógica do notebook)
+    df = df[df["TAB_IV_A_VL_PL"] >= 1_000].copy()
 
     # Cedente declarado (1 = declarado, 0 = ausente)
     df["cedente_declarado"] = df["TAB_I2A12_CPF_CNPJ_CEDENTE_1"].notna().astype(int)
 
+    # ── NOVAS FEATURES (notebook Cell 7) ────────────────────────────────────
+    # Ordenar para cálculos temporais corretos
+    df = df.sort_values(["CNPJ_FUNDO_CLASSE", "DT_COMPTC"])
+
+    # 1. Volatilidade da inadimplência por fundo (desvio-padrão histórico)
+    df["volatilidade_inad"] = (
+        df.groupby("CNPJ_FUNDO_CLASSE")["taxa_inadimplencia"]
+        .transform("std")
+        .fillna(0)
+    )
+
+    # 2. Volatilidade da taxa de aquisição por fundo
+    df["volatilidade_aquisicao"] = (
+        df.groupby("CNPJ_FUNDO_CLASSE")["taxa_aquisicao"]
+        .transform("std")
+        .fillna(0)
+    )
+
+    # 3. Inadimplência congelada: 1 se exatamente igual ao mês anterior
+    df["inad_congelada"] = (
+        df.groupby("CNPJ_FUNDO_CLASSE")["taxa_inadimplencia"]
+        .diff() == 0
+    ).astype(int)
+
+    # Limpeza de limites (consistente com o notebook)
+    df.loc[df["concentracao_cedente"] > 100, "concentracao_cedente"] = np.nan
+    df["concentracao_cedente"] = df["concentracao_cedente"].fillna(0)
+    df.loc[df["ratio_inad_giro"] > 100, "ratio_inad_giro"] = 0
+
+    # 8 features forenses do CatBoost (notebook Cell 12)
+    feature_cols = [
+        "taxa_aquisicao",
+        "taxa_devolucao_cedente",
+        "taxa_inadimplencia",
+        "concentracao_cedente",
+        "ratio_inad_giro",
+        "volatilidade_inad",
+        "volatilidade_aquisicao",
+        "inad_congelada",
+    ]
+
     return df, feature_cols
 
 
-@st.cache_data(show_spinner="Executando Isolation Forest…")
+@st.cache_data(show_spinner="Executando CatBoost Supervisionado…")
 def run_model(df_clean: pd.DataFrame, feature_cols: list, contamination: float):
-    """Treina o Isolation Forest nos dados de Mercado e puntua todos."""
-    df_valid = df_clean.dropna(subset=feature_cols).copy()
+    """Treina o CatBoost Supervisionado e pontua todos os registros válidos."""
+    # ── 1. Filtro de linhas válidas (PL >= 1M e todas features presentes) ──
+    mask_valido = df_clean[feature_cols].notna().all(axis=1)
+    mask_valido &= df_clean["TAB_IV_A_VL_PL"] >= 1_000_000
 
-    scaler = StandardScaler()
-    X_all  = scaler.fit_transform(df_valid[feature_cols])
+    df_valid = df_clean[mask_valido].copy()
+    X_clean = df_valid[feature_cols].copy()
 
-    # Treinar só no mercado de referência
-    mask_mercado = df_valid["grupo_economico"] == "Mercado"
-    X_train = X_all[mask_mercado]
+    # ── 2. Máscaras de treino ───────────────────────────────────────────────
+    # Mercado ativo = negativos (normais) — exclui fundos zumbi com giro < 1%
+    mask_fundos_ativos = df_valid["movimentacao_total_taxa"] > 0.01
+    mask_mercado       = (df_valid["grupo_economico"] == "Mercado") & mask_fundos_ativos
+    mask_investigado   = df_valid["grupo_economico"] != "Mercado"
 
-    model = IsolationForest(
-        n_estimators=200,
-        contamination=contamination,
-        random_state=42,
-        n_jobs=-1,
+    # ── 3. Teto lógico — evita explosões por erros de PL da CVM ───────────
+    p95_vol_inad = X_clean.loc[mask_mercado, "volatilidade_inad"].quantile(0.95)
+    p95_vol_aq   = X_clean.loc[mask_mercado, "volatilidade_aquisicao"].quantile(0.95)
+
+    X_clean["volatilidade_inad"]      = X_clean["volatilidade_inad"].clip(upper=min(p95_vol_inad, 1.0))
+    X_clean["volatilidade_aquisicao"] = X_clean["volatilidade_aquisicao"].clip(upper=min(p95_vol_aq, 1.0))
+    X_clean["taxa_inadimplencia"]     = X_clean["taxa_inadimplencia"].clip(upper=1.0)
+    X_clean["ratio_inad_giro"]        = X_clean["ratio_inad_giro"].clip(upper=5.0)
+
+    # ── 4. RobustScaler focado na mediana do mercado ───────────────────────
+    scaler = RobustScaler()
+    scaler.fit(X_clean[mask_mercado])
+    X_scaled_arr = scaler.transform(X_clean)
+    X_scaled = pd.DataFrame(X_scaled_arr, index=X_clean.index, columns=feature_cols)
+
+    # ── 5. Target supervisionado ───────────────────────────────────────────
+    # 1 = investigado (anomalia conhecida) | 0 = mercado ativo (normal)
+    y_treino = mask_investigado.astype(int)
+
+    # ── 6. Balanceamento de classes ────────────────────────────────────────
+    n_pos = int(y_treino.sum())
+    n_neg = int((y_treino == 0).sum())
+    scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+
+    # ── 7. Treinar CatBoost Supervisionado ─────────────────────────────────
+    cb_model = CatBoostClassifier(
+        iterations=500,
+        learning_rate=0.05,
+        depth=6,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric="AUC",
+        random_seed=42,
+        verbose=0,
     )
-    model.fit(X_train)
+    cb_model.fit(X_scaled, y_treino)
 
-    scores_raw = model.score_samples(X_all)        # negativo → mais anômalo
-    # Normalizar para [0,1] onde 1 = mais anômalo
-    s_min, s_max = scores_raw.min(), scores_raw.max()
-    df_valid["anomaly_score"] = 1 - (scores_raw - s_min) / (s_max - s_min)
-    df_valid["anomalia"]      = model.predict(X_all) == -1  # True = anômalo
+    # ── 8. Score = probabilidade de ser investigado (anomalia) ─────────────
+    probs = cb_model.predict_proba(X_scaled)[:, 1]
 
-    # Baseline mensal do mercado → excesso de suspeição (Gráfico 1 do notebook)
+    # ── 9. Gravar scores no DataFrame ─────────────────────────────────────
+    df_valid["anomaly_score"] = probs
+    df_valid["anomalia"]      = probs >= 0.50   # True = anômalo
+
+    # ── 10. Baseline mensal do mercado → excesso de suspeição ──────────────
     baseline = (
         df_valid[df_valid["grupo_economico"] == "Mercado"]
         .groupby("DT_COMPTC")["anomaly_score"]
@@ -457,7 +531,7 @@ def render_sidebar(df_raw: pd.DataFrame):
             value=(datas_disponiveis[0], datas_disponiveis[-1]),
         )
 
-        # ── Sensibilidade
+         # ── Sensibilidade
         st.markdown("---")
         sensibilidade = st.slider(
             "🎚 Sensibilidade da Investigação",
@@ -479,7 +553,7 @@ def render_sidebar(df_raw: pd.DataFrame):
 
         st.markdown("---")
         st.caption("**Fonte dos Dados:** CVM — dados.cvm.gov.br  \n"
-                   "**Metodologia:** Isolation Forest  \n"
+                   "**Metodologia:** CatBoost Supervisionado  \n"
                    "**Período:** Mar–Nov 2025")
 
     return dark_mode, grupos_sel, periodo, sensibilidade, score_threshold
@@ -585,39 +659,44 @@ def render_methodology():
         st.markdown("""
         <div class="subsection-title">O Detetive Digital</div>
         <div class="body-text">
-        O <strong>Isolation Forest</strong> funciona como um detetive que procura quem está 
-        "fora da fila". Imagine que você coloca todos os 3.882 fundos numa sala e pede a um 
-        investigador para encontrar os suspeitos usando perguntas de sim/não. 
+        O <strong>CatBoost Supervisionado</strong> funciona como um detetive que aprendeu
+        a reconhecer suspeitos a partir de casos confirmados. Em vez de apenas buscar quem
+        "está fora da fila", ele foi treinado com os próprios grupos investigados como
+        exemplos positivos e o mercado normal como referência negativa.
         <br><br>
-        Fundos <em>normais</em> se misturam com a multidão — precisam de muitas perguntas 
-        para serem identificados individualmente. Fundos <em>anômalos</em>, com comportamento 
-        incomum, ficam sozinhos num canto — o investigador os isola rapidamente, em poucos 
-        passos. Quanto mais fácil isolar, maior a <strong>nota de suspeição</strong>.
+        O modelo analisa <em>8 variáveis forenses simultâneas</em> — incluindo duas novas:
+        a <strong>volatilidade da inadimplência</strong> (fundos normais têm variação natural;
+        os suspeitos congelam os números) e a <strong>trava de imobilidade</strong>
+        (inadimplência exatamente igual por meses consecutivos é estatisticamente improvável).
         <br><br>
-        O modelo foi treinado <em>exclusivamente</em> com dados do mercado de referência 
-        (25.619 observações "normais") e depois aplicado aos grupos investigados — sem nunca 
-        ter visto os suspeitos durante o treinamento. Isso elimina qualquer viés de confirmação.
+        O modelo foi treinado com dados rotulados — mercado ativo como classe normal e grupos
+        investigados como classe anômala — usando balanceamento automático de classes.
+        O score final é a <strong>probabilidade estimada</strong> de o fundo pertencer ao
+        grupo investigado, de 0 (normal) a 1 (máxima semelhança com os suspeitos).
         </div>
         """, unsafe_allow_html=True)
 
     with st.expander("🔬 Detalhes técnicos do modelo (para especialistas)"):
         st.markdown("""
-        **Algoritmo:** `sklearn.ensemble.IsolationForest`  
-        **Estimadores:** 200 árvores de decisão aleatórias  
-        **Treinamento:** Dados do grupo "Mercado" (fundos sem vínculo com os grupos investigados)  
-        **Features (5 variáveis monitoradas):**
-        1. `taxa_inadimplencia` — Inadimplência declarada ÷ PL
-        2. `concentracao_cedente` — % da carteira do maior cedente
-        3. `taxa_aquisicao` — Novos contratos comprados ÷ PL
-        4. `taxa_devolucao_cedente` — Contratos recomprados ÷ PL
+        **Algoritmo:** `catboost.CatBoostClassifier` (Gradient Boosting Supervisionado)  
+        **Estimadores:** 500 árvores de decisão com profundidade 6  
+        **Treinamento:** Supervisionado — Mercado ativo como classe 0 (normal), grupos investigados como classe 1 (anomalia)  
+        **Balanceamento:** `scale_pos_weight` proporcional ao desequilíbrio de classes  
+        **Features (8 variáveis monitoradas):**
+        1. `taxa_aquisicao` — Novos contratos comprados ÷ PL
+        2. `taxa_devolucao_cedente` — Contratos recomprados pelo cedente ÷ PL
+        3. `taxa_inadimplencia` — Inadimplência declarada ÷ PL
+        4. `concentracao_cedente` — % da carteira do maior cedente
         5. `ratio_inad_giro` — Inadimplência ÷ Taxa de aquisição
+        6. `volatilidade_inad` — Desvio-padrão histórico da inadimplência por fundo
+        7. `volatilidade_aquisicao` — Desvio-padrão histórico da taxa de aquisição por fundo
+        8. `inad_congelada` — 1 se inadimplência idêntica ao mês anterior (trava artificial)
         
-        **Normalização:** `StandardScaler` (média 0, desvio-padrão 1)  
-        **Score final:** Normalizado para [0,1] onde 1 = máxima anomalia
+        **Normalização:** `RobustScaler` calibrado na mediana do mercado ativo  
+        **Score final:** Probabilidade [0,1] de pertencer aos grupos investigados (0 = normal, 1 = máxima anomalia)  
         
-        **Sinal forense central:** Alta taxa de aquisição + inadimplência declarada baixa + 
-        rentabilidade artificialmente estável → probabilidade < 0,3% de ocorrer por acaso em 
-        condições normais de mercado.
+        **Sinal forense central:** Alto giro + inadimplência congelada + volatilidade zero →
+        probabilidade < 0,3% de ocorrer por acaso em condições normais de mercado.
         """)
 
 
@@ -668,154 +747,6 @@ def render_metrics(df_model: pd.DataFrame, score_threshold: float):
             """, unsafe_allow_html=True)
 
     st.markdown('<div class="ornament">✦ ✦ ✦</div>', unsafe_allow_html=True)
-
-
-def render_violin_chart(df_model: pd.DataFrame, grupos_sel: list, dark_mode: bool):
-    st.markdown('<div class="subsection-title">Distribuição dos Comportamentos — Quão longe cada grupo está do normal?</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="body-text">
-    O gráfico abaixo mostra a <em>distribuição das notas de suspeição</em> para cada grupo. 
-    Quanto mais à direita e mais "achatada" a forma, mais uniforme e preocupante o comportamento 
-    atípico. A linha vermelha tracejada é a <strong>Média de Mercado</strong> — o padrão de 
-    referência dos fundos sem vínculo com os grupos investigados.
-    </div>
-    """, unsafe_allow_html=True)
-
-    df_plot = df_model[df_model["grupo_display"].isin(grupos_sel)].copy()
-    media_mercado = df_model[df_model["grupo_economico"] == "Mercado"]["anomaly_score"].mean()
-
-    # Paleta de cores por grupo
-    color_map = {
-        "Banco Master":      "#B22222",
-        "Master (CTVB)":     "#CC3333",
-        "Trustee DTVM":      "#E07000",
-        "Reag Trust DTVM":   "#D4A000",
-        "Letsbank":          "#6A0DAD",
-        "BRB":               "#1B6CA8",
-        "Banco Pleno":       "#2E8B57",
-        "Mercado (Referência)": "#888888",
-    }
-
-    bg_color   = "rgba(17,17,17,0)" if dark_mode else "rgba(240,242,246,0)"
-    font_color = "#E8E8E8" if dark_mode else "#1A1A1A"
-    grid_color = "#333333" if dark_mode else "#E5E7EB"
-
-    fig = go.Figure()
-    for grupo in sorted(df_plot["grupo_display"].unique()):
-        sub = df_plot[df_plot["grupo_display"] == grupo]["anomaly_score"].dropna()
-        if len(sub) < 5:
-            continue
-        fig.add_trace(go.Violin(
-            x=sub,
-            name=grupo,
-            orientation="h",
-            side="positive",
-            meanline_visible=True,
-            line_color=color_map.get(grupo, "#999999"),
-            fillcolor=color_map.get(grupo, "#999999"),
-            opacity=0.75,
-            points=False,
-            box_visible=True,
-        ))
-
-    # Linha de média do mercado
-    fig.add_vline(
-        x=media_mercado,
-        line_dash="dash",
-        line_color="#B22222",
-        line_width=2,
-        annotation_text=f"Média de Mercado ({media_mercado:.2f})",
-        annotation_position="top right",
-        annotation_font_color="#B22222",
-    )
-
-    fig.update_layout(
-        title="",
-        xaxis_title="Nota de Suspeição (0 = normal · 1 = altamente atípico)",
-        yaxis_title="",
-        plot_bgcolor=bg_color,
-        paper_bgcolor=bg_color,
-        font=dict(family="Inter", color=font_color, size=12),
-        xaxis=dict(gridcolor=grid_color, zeroline=False, range=[0, 1]),
-        yaxis=dict(gridcolor=grid_color),
-        legend=dict(orientation="v", x=1.01, y=1),
-        height=420,
-        margin=dict(l=20, r=140, t=20, b=40),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_scatter_chart(df_model: pd.DataFrame, grupos_sel: list, score_threshold: float, dark_mode: bool):
-    st.markdown('<div class="subsection-title">Mapa de Anomalias — Cada ponto é um fundo, cada mês</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="body-text">
-    Pontos <span style="color:#B22222;font-weight:bold;">■ vermelhos</span> representam 
-    fundos com comportamento atípico confirmado acima do limiar crítico. 
-    <span style="color:#888888;">■ Cinzas</span> são fundos dentro do padrão esperado. 
-    O eixo horizontal representa o tempo; o vertical, a nota de suspeição.
-    </div>
-    """, unsafe_allow_html=True)
-
-    df_plot = df_model[df_model["grupo_display"].isin(grupos_sel)].dropna(subset=["anomaly_score"]).copy()
-
-    bg_color   = "rgba(17,17,17,0)" if dark_mode else "rgba(240,242,246,0)"
-    font_color = "#E8E8E8" if dark_mode else "#1A1A1A"
-    grid_color = "#333333" if dark_mode else "#E5E7EB"
-
-    df_plot["cor"] = df_plot["anomaly_score"].apply(
-        lambda s: "Comportamento Atípico" if s >= score_threshold else "Dentro do Padrão"
-    )
-
-    fig = px.scatter(
-        df_plot,
-        x="DT_COMPTC",
-        y="anomaly_score",
-        color="cor",
-        color_discrete_map={
-            "Comportamento Atípico": "#B22222",
-            "Dentro do Padrão":      "#999999",
-        },
-        hover_data={
-            "DENOM_SOCIAL": True,
-            "grupo_display": True,
-            "anomaly_score": ":.3f",
-            "DT_COMPTC": True,
-            "cor": False,
-        },
-        labels={
-            "DT_COMPTC": "Competência",
-            "anomaly_score": "Nota de Suspeição",
-            "grupo_display": "Grupo",
-            "DENOM_SOCIAL": "Fundo",
-        },
-        opacity=0.65,
-        size_max=8,
-    )
-
-    fig.add_hline(
-        y=score_threshold,
-        line_dash="dot",
-        line_color="#B22222",
-        line_width=1.5,
-        annotation_text=f"Limiar crítico ({score_threshold:.2f})",
-        annotation_position="bottom right",
-        annotation_font_color="#B22222",
-    )
-
-    fig.update_traces(marker=dict(size=5))
-    fig.update_layout(
-        plot_bgcolor=bg_color,
-        paper_bgcolor=bg_color,
-        font=dict(family="Inter", color=font_color, size=12),
-        xaxis=dict(gridcolor=grid_color, zeroline=False),
-        yaxis=dict(gridcolor=grid_color, range=[-0.02, 1.02]),
-        legend=dict(title="", orientation="h", y=-0.15),
-        height=380,
-        margin=dict(l=20, r=20, t=20, b=40),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
 
 
 # ── GRÁFICOS DO NOTEBOOK ─────────────────────────────────────────────────────
@@ -1425,8 +1356,8 @@ def render_evidence_table(df_model: pd.DataFrame, score_threshold: float):
 
     styled = (
         df_show.style
-        .applymap(color_score, subset=["Nota de Suspeição"])
-        .applymap(color_alerta, subset=["Alerta"])
+        .map(color_score, subset=["Nota de Suspeição"])
+        .map(color_alerta, subset=["Alerta"])
         .set_properties(**{
             "font-family": "Inter, sans-serif",
             "font-size": "13px",
@@ -1553,7 +1484,7 @@ def render_footer():
     st.markdown("""
     <div style="text-align:center;font-family:'Inter',sans-serif;font-size:11px;opacity:.5;padding:20px 0 40px 0;">
         Análise baseada exclusivamente em dados públicos disponibilizados pela CVM em dados.cvm.gov.br<br>
-        Metodologia: Isolation Forest (scikit-learn) · Dados: Março–Novembro 2025<br>
+        Metodologia: CatBoost Supervisionado · Dados: Março–Novembro 2025<br>
         Este relatório tem finalidade acadêmica e investigativa. Não constitui recomendação de investimento.
     </div>
     """, unsafe_allow_html=True)
@@ -1568,7 +1499,7 @@ def main():
         df_raw, feature_cols = load_data()
     except FileNotFoundError:
         st.error(
-            "⚠️ Arquivo `df_master_fidc_2025.csv` não encontrado. "
+            "⚠️ Arquivo `.csv` não encontrado. "
             "Coloque-o na mesma pasta que `app.py` e reinicie o servidor."
         )
         st.stop()
@@ -1603,25 +1534,19 @@ def main():
     st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Análise Visual — Os Dados Falam</div>', unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 Distribuição por Grupo",
-        "🔴 Mapa de Anomalias",
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Excesso Temporal",
         "🏆 Ranking de Fundos",
         "🗺️ Mapa Forense TM×TI",
         "🎻 Violin por Grupo",
     ])
     with tab1:
-        render_violin_chart(df_display, grupos_para_exibir, dark_mode)
-    with tab2:
-        render_scatter_chart(df_display, grupos_para_exibir, score_threshold, dark_mode)
-    with tab3:
         render_excesso_temporal(df_model, dark_mode)
-    with tab4:
+    with tab2:
         render_ranking_fundos(df_model, dark_mode)
-    with tab5:
+    with tab3:
         render_mapa_forense(df_model, grupos_para_exibir, dark_mode)
-    with tab6:
+    with tab4:
         render_distribuicao_violin(df_model, dark_mode)
 
     # Tabela de evidências
